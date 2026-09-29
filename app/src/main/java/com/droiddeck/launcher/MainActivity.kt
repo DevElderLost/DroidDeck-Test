@@ -149,6 +149,9 @@ class MainActivity : ComponentActivity() {
     private val pickAndroidDriver = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == RESULT_OK) InAppFilePicker.pickedUri(r.data)?.let { drivers.importDriver(it, linux = false) }
     }
+    private val pickDeckyPluginZip = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode == RESULT_OK) InAppFilePicker.pickedFile(r.data)?.let { decky.importPluginZip(it) }
+    }
     private val pickAddedGamesDir = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == RESULT_OK) InAppFilePicker.pickedPath(r.data)?.let { path ->
             SessionPrefs.setAddedGamesDirs(this, addedGamesDirs + path)
@@ -881,6 +884,9 @@ class MainActivity : ComponentActivity() {
                     DeckyManager.uninstall(this, wipeData = false)
                     decky.deckyInstalled = null
                     decky.deckySupervisor = false
+                },
+                onPickDeckyPluginZip = {
+                    pickDeckyPluginZip.launch(InAppFilePicker.buildIntent(this, ZIP_EXT, "Choose a Decky plugin ZIP"))
                 },
                 onDismiss = { settingsMode = null },
             ),
