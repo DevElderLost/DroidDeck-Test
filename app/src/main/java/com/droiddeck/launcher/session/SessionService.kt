@@ -76,7 +76,13 @@ class SessionService : Service() {
     private var manualPauseRequested = false
     /** An explicit Steam sleep request is independent of the background policy. */
     private var steamSleepToken: String? = null
-    private var suspendOperationPending = false
+    private var explicitPauseRequested = false
+    private var suspendOperationPending: Boolean
+        get() = SessionState.suspendPending
+        set(value) { SessionState.suspendPending = value }
+    private val audioWorker = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var pipAudio: PipAudioMute? = null
+    private var pipTask = false
     private var suspendAttemptFailed = false
     private var screenReceiverRegistered = false
     private val screenReceiver = object : BroadcastReceiver() {
@@ -140,7 +146,12 @@ class SessionService : Service() {
                 stopSession(0)
                 return START_NOT_STICKY
             }
+            ACTION_PIP_BEGIN -> {
+                pipTask = true
+                return START_NOT_STICKY
+            }
             ACTION_ACTIVITY_VISIBLE -> {
+                if (!SessionState.pipActive) pipTask = false
                 activityVisible = true
                 resumeSteamSleepOnReturn()
                 suspendAttemptFailed = false
@@ -160,7 +171,28 @@ class SessionService : Service() {
                 updateSuspendPolicy()
                 return START_NOT_STICKY
             }
+            ACTION_PIP_SUSPEND, ACTION_PIP_RESUME -> {
+                if (!validPipAction(intent) || suspendOperationPending) return START_NOT_STICKY
+                if (intent.action == ACTION_PIP_SUSPEND) {
+                    explicitPauseRequested = true
+                    suspendAttemptFailed = false
+                    updateSuspendPolicy()
+                    return START_NOT_STICKY
+                }
+                // Resume uses the same sleep-token and policy handling as the notification.
+                resumeSession()
+                return START_NOT_STICKY
+            }
+            ACTION_PIP_MUTE, ACTION_PIP_UNMUTE -> {
+                if (validPipAction(intent) && !SessionState.pipMutePending) changePipMute(intent.action == ACTION_PIP_MUTE)
+                return START_NOT_STICKY
+            }
+            ACTION_PIP_END -> {
+                restorePipAudio()
+                return START_NOT_STICKY
+            }
             ACTION_RESUME -> {
+                explicitPauseRequested = false
                 activityVisible = true
                 screenOn = (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: screenOn
                 manualPauseRequested = false
@@ -187,6 +219,10 @@ class SessionService : Service() {
         suspendAttemptFailed = false
         suspendController = null
         SessionState.suspended = false
+        explicitPauseRequested = false
+        SessionState.pipActive = false
+        SessionState.pipMuted = false
+        SessionState.pipMutePending = false
         SessionState.program = intent?.getStringExtra(EXTRA_PROGRAM)
         SessionState.programArgs = intent?.getStringArrayExtra(EXTRA_PROGRAM_ARGS)?.toList().orEmpty()
         SessionState.steamUi = intent?.getStringExtra(EXTRA_STEAM_UI)
@@ -993,12 +1029,72 @@ class SessionService : Service() {
         launchWatcher = watcher
     }
 
+    private fun validPipAction(intent: Intent): Boolean = SessionState.running && SessionState.pipActive &&
+        intent.getLongExtra(EXTRA_PIP_VISIT, -1) == SessionState.pipVisit
+
+    private fun resumeSession() {
+        explicitPauseRequested = false
+        activityVisible = true
+        screenOn = (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: screenOn
+        manualPauseRequested = false
+        completeSteamSleep()
+        suspendAttemptFailed = false
+        updateSuspendPolicy()
+    }
+
+    private fun changePipMute(muted: Boolean) {
+        SessionState.pipMutePending = true
+        val gen = sessionGen
+        val visit = SessionState.pipVisit
+        val outputs = components.mapNotNull { part -> when (part) {
+            is PulseAudioComponent -> object : PipAudioMute.Output {
+                override fun muted() = part.outputMuted
+                override fun mute(value: Boolean) = part.setOutputMuted(value)
+            }
+            is DirectAudioRelayComponent -> object : PipAudioMute.Output {
+                override fun muted() = part.outputMuted
+                override fun mute(value: Boolean) = part.setOutputMuted(value)
+            }
+            else -> null
+        } }
+        audioWorker.execute {
+            val control = pipAudio ?: PipAudioMute(outputs).also { pipAudio = it }
+            val success = control.setMuted(muted)
+            mainHandler.post {
+                if (gen != sessionGen || visit != SessionState.pipVisit) return@post
+                SessionState.pipMutePending = false
+                if (success) SessionState.pipMuted = muted else audioMuteFailed()
+            }
+        }
+    }
+
+    private fun restorePipAudio() {
+        val gen = sessionGen
+        val visit = SessionState.pipVisit
+        audioWorker.execute {
+            val control = pipAudio
+            var success = control?.restore() ?: true
+            if (!success) success = control?.restore() ?: true
+            if (success) pipAudio = null
+            mainHandler.post {
+                if (gen != sessionGen || visit != SessionState.pipVisit) return@post
+                SessionState.pipMutePending = false
+                if (success) SessionState.pipMuted = false else audioMuteFailed()
+            }
+        }
+    }
+
+    private fun audioMuteFailed() {
+        Log.w(TAG, "PiP audio state could not be confirmed")
+        android.widget.Toast.makeText(this, R.string.pip_audio_failed, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
     private fun updateSuspendPolicy() {
         if (!SessionState.running) return
         if (suspendPolicy == SessionPrefs.SUSPEND_MANUAL && (!activityVisible || !screenOn)) {
             manualPauseRequested = true
         }
-        val shouldSuspend = steamSleepToken != null || when (suspendPolicy) {
+        val shouldSuspend = explicitPauseRequested || steamSleepToken != null || when (suspendPolicy) {
             SessionPrefs.SUSPEND_AUTO -> !activityVisible || !screenOn
             SessionPrefs.SUSPEND_MANUAL -> manualPauseRequested
             else -> false
@@ -1077,6 +1173,11 @@ class SessionService : Service() {
                 return@post
             }
             SessionState.suspended = false
+            SessionState.suspendPending = false
+            SessionState.pipActive = false
+            SessionState.pipMuted = false
+            SessionState.pipMutePending = false
+            if (!audioWorker.isShutdown) audioWorker.execute { pipAudio = null }
             SessionState.guestPid = -1
             releaseLocks()
             if (status == 0) {
@@ -1185,6 +1286,12 @@ class SessionService : Service() {
      * guest would survive as an orphan holding the rootfs and the GPU. Treat the swipe as "quit".
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
+        if (pipTask) {
+            Log.i(TAG, "PiP task dismissed - retaining the session under its background policy")
+            activityVisible = false
+            updateSuspendPolicy()
+            return
+        }
         Log.i(TAG, "task removed - ending the session")
         stopSession(0)
         super.onTaskRemoved(rootIntent)
@@ -1196,6 +1303,7 @@ class SessionService : Service() {
             unregisterReceiver(screenReceiver)
             screenReceiverRegistered = false
         }
+        audioWorker.shutdown()
         super.onDestroy()
     }
 
@@ -1325,6 +1433,13 @@ class SessionService : Service() {
         private const val NOTIFICATION_ID = 1001
         const val ACTION_STOP = "com.droiddeck.launcher.STOP_SESSION"
         const val ACTION_RESUME = "com.droiddeck.launcher.RESUME_SESSION"
+        const val ACTION_PIP_SUSPEND = "com.droiddeck.launcher.PIP_SUSPEND"
+        const val ACTION_PIP_RESUME = "com.droiddeck.launcher.PIP_RESUME"
+        const val ACTION_PIP_MUTE = "com.droiddeck.launcher.PIP_MUTE"
+        const val ACTION_PIP_UNMUTE = "com.droiddeck.launcher.PIP_UNMUTE"
+        const val EXTRA_PIP_VISIT = "pipVisit"
+        private const val ACTION_PIP_BEGIN = "com.droiddeck.launcher.PIP_BEGIN"
+        private const val ACTION_PIP_END = "com.droiddeck.launcher.PIP_END"
         const val ACTION_HOME_GUIDE = "com.droiddeck.launcher.HOME_GUIDE"
         const val ACTION_AGENT_START = "com.droiddeck.launcher.AGENT_START"
         private const val ACTION_SUSPEND_POLICY_CHANGED = "com.droiddeck.launcher.SUSPEND_POLICY_CHANGED"
@@ -1379,6 +1494,14 @@ class SessionService : Service() {
                 return
             }
             context.startService(Intent(context, SessionService::class.java).setAction(ACTION_STOP))
+        }
+
+        fun beginPip(context: Context) {
+            context.startService(Intent(context, SessionService::class.java).setAction(ACTION_PIP_BEGIN))
+        }
+
+        fun endPip(context: Context) {
+            if (SessionState.running) context.startService(Intent(context, SessionService::class.java).setAction(ACTION_PIP_END))
         }
 
         fun setActivityVisible(context: Context, visible: Boolean) {

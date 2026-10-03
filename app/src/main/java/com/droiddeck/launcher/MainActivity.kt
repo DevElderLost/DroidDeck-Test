@@ -991,6 +991,8 @@ class MainActivity : ComponentActivity() {
                 gpuDrivers = drivers.summary(),
                 touchMode = touchMode,
                 suspendPolicy = suspendPolicy,
+                pipSupported = com.droiddeck.launcher.session.SessionPipController.supported(this),
+                pipAutoEnter = pipAutoEnter,
                 oscMode = if (mode == SessionService.MODE_STEAM) oscMode else null,
                 backActionsInverted = backActionsInverted,
                 directAudio = if (mode == SessionService.MODE_STEAM) directAudio else null,
@@ -1044,6 +1046,7 @@ class MainActivity : ComponentActivity() {
                 onFpsLimit = { fps -> SessionPrefs.setFpsLimit(this, mode, fps); fpsLimit = fps },
                 onTouch = { t -> SessionPrefs.setTouchMode(this, t); touchMode = t },
                 onSuspendPolicy = { policy -> SessionPrefs.setSuspendPolicy(this, mode, policy); suspendPolicy = policy },
+                onPipAutoEnter = { on -> SessionPrefs.setPipAutoEnter(this, on); pipAutoEnter = on },
                 onOsc = { o -> SessionPrefs.setOscMode(this, o); oscMode = o },
                 onBackActionsInverted = { inverted ->
                     SessionPrefs.setBackActionsInverted(this, inverted)
@@ -1163,7 +1166,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var pipAutoEnter by mutableStateOf(false)
+
     private fun openModeSettings(mode: String) {
+        pipAutoEnter = SessionPrefs.pipAutoEnter(this)
         showPerformance = false
         showProtons = false
         showComponents = false
